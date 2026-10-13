@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+
+  <PropertyGroup>
+    <ProjectGuid>{C2345678-2345-2345-2345-234567890021}</ProjectGuid>
+    <AssemblyName>TiaApiServer.V21</AssemblyName>
+    <TiaDefine>TIA_V21</TiaDefine>
+  </PropertyGroup>
+
+  <Import Project="TiaApiServer.common.props" />
+
+  <!--
+    V21 은 PublicAPI 를 재포장했다: PublicAPI\V21\net48 아래로 한 단계 더
+    들어가고, 단일 Siemens.Engineering.dll 이 기능별로 쪼개졌다.
+
+    Program.cs 의 using 27개를 V21 어셈블리에 실제로 매핑한 결과(XML 문서 실측):
+      Base          Siemens.Engineering · .Multiuser · .Compiler
+                    · .Library · .Library.MasterCopies · .Library.Types · .HW(.Features)
+      Step7         .SW · .SW.Blocks · .SW.Tags · .SW.Types · .SW.Units
+                    · .SW.ExternalSources · .SW.TechnologicalObjects · .Cax · .HW(.Features)
+      WinCC         .Hmi · .Hmi.Communication · .Hmi.Screen · .Hmi.Tag · .Hmi.TextGraphicList
+      WinCCUnified  .HmiUnified · .HmiUnified.HmiConnections
+                    · .HmiUnified.UI.Screens · .HmiUnified.UI.ScreenGroup
+      Startdrive    .MC.Drives · .MC.Drives.DFI
+
+    네임스페이스와 타입 이름은 V19/V20 과 동일하므로 Program.cs 는 손댈 것이
+    없다 — 바뀌는 것은 이 <Reference> 목록뿐이다.
+
+    Private=False — Openness DLL 을 출력 폴더로 복사하지 않는다. 복사해 두면
+    CLR 이 exe 옆의 사본을 AssemblyResolve 보다 먼저 집어가서 버전이 섞인다.
+    런타임 경로 선택은 Entry.Install() 의 AssemblyResolve 가 전담한다
+    (PublicApiDir 가 major>=21 에서 net48 한 단계를 더 붙인다).
+  -->
+  <ItemGroup>
+    <Reference Include="Siemens.Engineering.Base">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.Base.dll</HintPath>
+    </Reference>
+    <Reference Include="Siemens.Engineering.Step7">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.Step7.dll</HintPath>
+    </Reference>
+    <Reference Include="Siemens.Engineering.WinCC">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.WinCC.dll</HintPath>
+    </Reference>
+    <Reference Include="Siemens.Engineering.WinCCUnified">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.WinCCUnified.dll</HintPath>
+    </Reference>
+    <Reference Include="Siemens.Engineering.Startdrive">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.Startdrive.dll</HintPath>
+    </Reference>
+    <Reference Include="Siemens.Engineering.Contract">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V21\Bin\PublicAPI\Siemens.Engineering.Contract.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>

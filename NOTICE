@@ -1,0 +1,36 @@
+TIA Portal Third-Party Bridge
+Copyright (c) 2026 MinJun Kim
+Licensed under the MIT License (see LICENSE).
+
+────────────────────────────────────────────────────────────────────────
+Third-party notices
+────────────────────────────────────────────────────────────────────────
+
+This project interoperates with Siemens TIA Portal through its publicly
+documented Openness API. It is an independent work and is not affiliated
+with, endorsed by, or sponsored by Siemens AG.
+
+NO SIEMENS SOFTWARE IS INCLUDED OR REDISTRIBUTED HERE.
+
+  * The Openness assemblies (Siemens.Engineering*.dll and related files)
+    are NOT part of this repository. The project files reference them by
+    path from a TIA Portal installation that the user must license and
+    install separately. See docs/BUILD_AND_RUN.md.
+
+  * No Siemens hardware catalog data, device description files (GSD/GSDML),
+    motor or drive parameter tables, project files, or other content
+    extracted from a TIA Portal installation is included.
+
+  * Article numbers that appear in source comments and API documentation
+    (for example 6ES7 517-3AP00-0AB0) are used solely as illustrative
+    identifiers for API parameters.
+
+SIEMENS, TIA Portal, SIMATIC, STEP 7, WinCC, SINAMICS and Startdrive are
+trademarks or registered trademarks of Siemens AG. MITSUBISHI ELECTRIC and
+GX Works are trademarks of Mitsubishi Electric Corporation. All other
+trademarks are the property of their respective owners. They are used here
+only to identify the products this software interoperates with (nominative
+use), not to claim any association.
+
+Users are responsible for complying with the license terms of their own
+TIA Portal installation when using this software.

@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TIA Portal Openness REST API</title>
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+<style>
+body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+.swagger-ui .topbar { background: #1b1b1b; }
+.notice-banner {
+  background: linear-gradient(135deg, #fff3cd 0%, #ffeaa7 100%);
+  border-bottom: 3px solid #f0ad4e;
+  padding: 16px 24px; display: flex; align-items: flex-start; gap: 12px;
+}
+.notice-banner .icon { font-size: 24px; flex-shrink: 0; margin-top: 2px; }
+.notice-banner h3 { margin: 0 0 8px 0; color: #856404; font-size: 15px; }
+.notice-banner p { margin: 0; color: #664d03; font-size: 13px; line-height: 1.6; }
+.notice-banner ul { margin: 6px 0 0 0; padding-left: 18px; color: #664d03; font-size: 13px; line-height: 1.8; }
+.notice-banner code { background: rgba(0,0,0,0.08); padding: 2px 6px; border-radius: 3px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div class="notice-banner">
+  <span class="icon">&#9888;&#65039;</span>
+  <div>
+    <h3>&#51221;&#51201; &#49828;&#54665; &#47785;&#47197; &#8212; &#49892;&#51221;&#51008; &#47196;&#52984; &#50672;&#44208;&#51060; &#54596;&#50836;&#54633;&#45768;&#45796;</h3>
+    <p>&#51060; &#54168;&#51060;&#51648;&#45716; <code>openapi.json</code> &#51012; &#44536;&#45824;&#47196; &#48372;&#50668;&#51452;&#45716; &#51221;&#51201; &#47785;&#47197;&#51077;&#45768;&#45796;.</p>
+    <ul>
+      <li>&#8220;Try it out&#8221; &#51008; <code>TiaApiServer</code> &#44032; <code>http://localhost:8099</code> &#50640;&#49436; &#49892;&#54665; &#51473;&#51068; &#46412;&#47564; &#46041;&#51089;&#54633;&#45768;&#45796;.</li>
+      <li>Openness &#45716; &#47196;&#52984; &#54532;&#47196;&#49884;&#49828; &#44036; &#53685;&#49888;&#47564; &#51648;&#50896;&#54633;&#45768;&#45796; &#8212; &#50896;&#44608; &#49436;&#48260;&#50640;&#49436;&#45716; &#49324;&#50857;&#54624; &#49688; &#50629;&#49845;&#45768;&#45796;.</li>
+      <li>&#49892;&#54665; &#51232;&#44148;&#44284; &#49692;&#49436;&#45716; <code>docs/BUILD_AND_RUN.md</code> &#50640; &#51080;&#49845;&#45768;&#45796;.</li>
+    </ul>
+  </div>
+</div>
+
+<div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>
+SwaggerUIBundle({
+  url: './openapi.json',
+  dom_id: '#swagger-ui',
+  deepLinking: true,
+  presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+  layout: 'BaseLayout',
+  defaultModelsExpandDepth: -1,
+  docExpansion: 'list',
+  tryItOutEnabled: true
+});
+</script>
+</body>
+</html>

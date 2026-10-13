@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+
+  <PropertyGroup>
+    <ProjectGuid>{7C2A5E20-9D41-4B20-A320-5E2002200020}</ProjectGuid>
+    <AssemblyName>TiaInspector.V20</AssemblyName>
+    <TiaDefine>TIA_V20</TiaDefine>
+  </PropertyGroup>
+
+  <Import Project="TiaInspector.common.props" />
+
+  <!-- V19/V20 은 PublicAPI\V20 에 단일 Siemens.Engineering.dll 이 있다.
+       Private=False — Openness DLL 은 출력 폴더로 복사하지 않고 런타임에
+       설치 경로에서 리졸브한다(OpennessResolver). 복사하면 버전이 섞인다. -->
+  <ItemGroup>
+    <Reference Include="Siemens.Engineering">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V20\PublicAPI\V20\Siemens.Engineering.dll</HintPath>
+    </Reference>
+    <Reference Include="Siemens.Engineering.Contract">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V20\Bin\PublicAPI\Siemens.Engineering.Contract.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>

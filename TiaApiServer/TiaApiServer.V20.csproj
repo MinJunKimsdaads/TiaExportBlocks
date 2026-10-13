@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+
+  <PropertyGroup>
+    <ProjectGuid>{C2345678-2345-2345-2345-234567890020}</ProjectGuid>
+    <AssemblyName>TiaApiServer.V20</AssemblyName>
+    <TiaDefine>TIA_V20</TiaDefine>
+  </PropertyGroup>
+
+  <Import Project="TiaApiServer.common.props" />
+
+  <!--
+    V19/V20 은 PublicAPI\V20 에 단일 Siemens.Engineering.dll 이 있다.
+    Private=False — Openness DLL 을 출력 폴더로 복사하지 않는다. 복사해 두면
+    CLR 이 exe 옆의 사본을 AssemblyResolve 보다 먼저 집어가서 버전이 섞인다.
+    런타임 경로 선택은 Entry.Install() 의 AssemblyResolve 가 전담한다.
+  -->
+  <ItemGroup>
+    <Reference Include="Siemens.Engineering">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V20\PublicAPI\V20\Siemens.Engineering.dll</HintPath>
+    </Reference>
+    <Reference Include="Siemens.Engineering.Hmi">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V20\PublicAPI\V20\Siemens.Engineering.Hmi.dll</HintPath>
+    </Reference>
+    <Reference Include="Siemens.Engineering.Contract">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V20\Bin\PublicAPI\Siemens.Engineering.Contract.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>

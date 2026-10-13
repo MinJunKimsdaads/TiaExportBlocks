@@ -1,0 +1,13 @@
+# 저장소 안에서는 모든 텍스트를 LF 로 저장한다.
+# 체크아웃할 때도 LF 로 내린다 — Visual Studio · MSBuild · PowerShell 모두 LF 를 읽는다.
+# (OS마다 줄바꿈이 달라져서 diff 가 파일 전체로 번지는 걸 막는다)
+* text=auto eol=lf
+
+# 바이너리 — 줄바꿈 변환 금지
+*.dll binary
+*.exe binary
+*.pdb binary
+*.zip binary
+*.png binary
+*.jpg binary
+*.ico binary

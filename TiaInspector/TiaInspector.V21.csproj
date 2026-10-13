@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+
+  <PropertyGroup>
+    <ProjectGuid>{7C2A5E21-9D41-4B21-A321-5E2102210021}</ProjectGuid>
+    <AssemblyName>TiaInspector.V21</AssemblyName>
+    <TiaDefine>TIA_V21</TiaDefine>
+  </PropertyGroup>
+
+  <Import Project="TiaInspector.common.props" />
+
+  <!--
+    V21 은 PublicAPI 를 재포장했다: PublicAPI\V21\net48 아래로 한 단계 더
+    들어가고, 단일 Siemens.Engineering.dll 이 기능별로 쪼개졌다.
+      Base   TiaPortal · Project · HW(Device·DeviceItem·SoftwareContainer)
+             · MultilingualText · ExportOptions · Compiler
+      Step7  SW.* 전부 (PlcSoftware · Blocks · Types · Tags · Units)
+    네임스페이스와 타입 이름은 그대로라 src/ 는 손댈 것이 없다.
+
+    Private=False — Openness DLL 은 출력 폴더로 복사하지 않고 런타임에 설치
+    경로에서 리졸브한다(OpennessResolver). 복사하면 버전이 섞인다.
+  -->
+  <ItemGroup>
+    <Reference Include="Siemens.Engineering.Base">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.Base.dll</HintPath>
+    </Reference>
+    <Reference Include="Siemens.Engineering.Step7">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V21\PublicAPI\V21\net48\Siemens.Engineering.Step7.dll</HintPath>
+    </Reference>
+    <Reference Include="Siemens.Engineering.Contract">
+      <SpecificVersion>False</SpecificVersion>
+      <Private>False</Private>
+      <HintPath>C:\Program Files\Siemens\Automation\Portal V21\Bin\PublicAPI\Siemens.Engineering.Contract.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>
