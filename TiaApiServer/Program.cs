@@ -3723,7 +3723,7 @@ namespace TiaApiServer
             EnsureConnected();
             foreach (Project proj in connectedPortal.Projects)
             {
-                foreach (Device device in proj.Devices)
+                foreach (Device device in EnumerateAllDevices(proj))
                 {
                     // 1) 디바이스 이름이 일치하면 하위 전체를 탐색하여 HmiTarget을 찾는다
                     if (device.Name == deviceItemName)
@@ -3778,7 +3778,7 @@ namespace TiaApiServer
             EnsureConnected();
             foreach (Project proj in connectedPortal.Projects)
             {
-                foreach (Device device in proj.Devices)
+                foreach (Device device in EnumerateAllDevices(proj))
                 {
                     if (device.Name == deviceItemName)
                     {
@@ -4323,7 +4323,888 @@ namespace TiaApiServer
                 return;
             }
 
+            // ── 화면 내용 조회 (읽기 전용) ──
+            if (route == "screens") { ListUnifiedHmiScreens(ctx.Response, hmi); return; }
+            if (route == "item-types") { ListUnifiedItemTypes(ctx); return; }
+            if (route == "resources") { ListUnifiedResources(ctx, hmi); return; }
+            if (route == "faceplates") { ListUnifiedFaceplates(ctx, hmi); return; }
+            if (route == "graphics/export") { ExportUnifiedGraphics(ctx, hmi); return; }
+            if (route == "catalog/export") { ExportUnifiedCatalog(ctx, hmi); return; }
+            if (route == "screen" && ctx.Request.HttpMethod == "GET") { DumpUnifiedScreen(ctx, hmi); return; }
+            // ── 화면 생성 · 수정 · 삭제 (프로젝트를 바꾼다 — 저장은 하지 않는다) ──
+            if (route == "screen" && (ctx.Request.HttpMethod == "POST" || ctx.Request.HttpMethod == "PUT")) { ApplyUnifiedScreen(ctx, hmi); return; }
+            if (route == "screen" && ctx.Request.HttpMethod == "DELETE") { DeleteUnifiedScreen(ctx, hmi); return; }
+            if (route == "screen-group" && ctx.Request.HttpMethod == "DELETE") { DeleteUnifiedScreenGroup(ctx, hmi); return; }
+
             SendJson(ctx.Response, 404, new { error = "Unknown HMI Unified route: " + route });
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  Unified 화면 내용 조회
+        //
+        //  GET /api/hmi-unified/screen?hmi=<장치>&screen=<그룹/…/화면>[&depth=2][&defaults=false]
+        //
+        //  Unified 는 화면 Export 가 없다(HmiScreenComposition 에 Create · Find 뿐).
+        //  그래서 객체 모델을 직접 돌며 속성을 읽는다. 속성 이름은 Openness 의
+        //  GetAttributeInfos() 가 주는 그대로 — 나중에 같은 이름으로 쓸 수 있다.
+        //
+        //  읽지 않는 것: HmiSystemDiagnosisControl 의 속성. V21 에서
+        //  ScriptDiagnosisOverviewText 를 읽으면 TIA 가 죽는다는 보고가 있다.
+        // ══════════════════════════════════════════════════════════════
+
+        static readonly HashSet<string> UnifiedSkipTypes = new HashSet<string> { "HmiSystemDiagnosisControl" };
+        // Interface — 페이스플레이트 · 커스텀 위젯의 인터페이스 속성(이름 · 값 · 동적화)
+        static readonly string[] UnifiedListProps = { "Dynamizations", "EventHandlers", "PropertyEventHandlers", "Interface" };
+
+        static void DumpUnifiedScreen(HttpListenerContext ctx, HmiSoftware hmi)
+        {
+            string path = ctx.Request.QueryString["screen"];
+            if (string.IsNullOrEmpty(path)) { SendJson(ctx.Response, 400, new { error = "Missing ?screen= (그룹/화면 경로)" }); return; }
+            int depth = 2;
+            int.TryParse(ctx.Request.QueryString["depth"] ?? "2", out depth);
+            var screen = FindUnifiedScreenByPath(hmi, path) as HmiScreen;
+            if (screen == null) { SendJson(ctx.Response, 404, new { error = "Screen not found: " + path }); return; }
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var errors = new List<string>();
+            var result = DumpUnifiedObject(screen, depth, errors);
+            var items = new List<object>();
+            var typeCount = new Dictionary<string, int>();
+            foreach (var item in screen.ScreenItems)
+            {
+                string tn = item.GetType().Name;
+                int n; typeCount.TryGetValue(tn, out n); typeCount[tn] = n + 1;
+                items.Add(DumpUnifiedObject(item, depth, errors));
+            }
+            result["items"] = items;
+            SendJson(ctx.Response, 200, new
+            {
+                hmi = SafeAttr(hmi, "Name"),
+                path,
+                itemCount = items.Count,
+                itemTypes = typeCount,
+                elapsedMs = sw.ElapsedMilliseconds,
+                errorCount = errors.Count,
+                errors = errors.Take(50).ToList(),
+                screen = result
+            });
+        }
+
+        // 객체 하나 → { type, 속성…, 파트…, dynamizations, events }
+        static Dictionary<string, object> DumpUnifiedObject(IEngineeringObject obj, int depth, List<string> errors)
+        {
+            var d = new Dictionary<string, object>();
+            string typeName = obj.GetType().Name;
+            d["type"] = typeName;
+            if (UnifiedSkipTypes.Contains(typeName))
+            {
+                d["Name"] = SafeAttr(obj, "Name");
+                d["skipped"] = "속성을 읽지 않는다 (V21 에서 TIA 가 죽는다는 보고)";
+                return d;
+            }
+
+            IList<EngineeringAttributeInfo> infos = null;
+            try { infos = obj.GetAttributeInfos(); }
+            catch (Exception ex) { errors.Add(typeName + ".GetAttributeInfos: " + ex.Message); }
+            var attrNames = new HashSet<string>();
+            if (infos != null)
+            {
+                foreach (var info in infos)
+                {
+                    attrNames.Add(info.Name);
+                    try
+                    {
+                        object v = obj.GetAttribute(info.Name);
+                        var eo = v as IEngineeringObject;
+                        if (eo != null && v.GetType().Name.Contains("MultilingualText")) d[info.Name] = UnifiedValue(v);
+                        else if (eo != null)
+                        {
+                            // 파트(Font · Padding …) — 한 단계 더
+                            if (depth > 0) d[info.Name] = DumpUnifiedObject(eo, depth - 1, errors);
+                        }
+                        else d[info.Name] = UnifiedValue(v);
+                    }
+                    catch (Exception ex) { errors.Add(typeName + "." + info.Name + ": " + ex.Message); }
+                }
+            }
+
+            // 컴포지션 — 동적화 · 이벤트
+            if (depth > 0)
+            {
+                foreach (var pn in UnifiedListProps)
+                {
+                    try
+                    {
+                        var pi = UnifiedProp(obj.GetType(), pn);
+                        if (pi == null) continue;
+                        var en = pi.GetValue(obj, null) as System.Collections.IEnumerable;
+                        if (en == null) continue;
+                        var list = new List<object>();
+                        foreach (var e in en)
+                        {
+                            var eo = e as IEngineeringObject;
+                            if (eo == null) continue;
+                            var one = DumpUnifiedObject(eo, depth - 1, errors);
+                            // 스크립트 본문 — 이벤트 핸들러의 Script, 스크립트 동적화의 ScriptCode
+                            try
+                            {
+                                var sp = e.GetType().GetProperty("Script");
+                                var so = sp != null ? sp.GetValue(e, null) as IEngineeringObject : null;
+                                if (so != null && !one.ContainsKey("Script")) one["Script"] = DumpUnifiedObject(so, 0, errors);
+                            }
+                            catch (Exception ex) { errors.Add(typeName + "." + pn + ".Script: " + ex.Message); }
+                            list.Add(one);
+                        }
+                        if (list.Count > 0) d[pn] = list;
+                    }
+                    catch (Exception ex) { errors.Add(typeName + "." + pn + ": " + ex.Message); }
+                }
+            }
+            return d;
+        }
+
+        static object UnifiedValue(object v)
+        {
+            if (v == null) return null;
+            if (v is string || v is bool) return v;
+            var t = v.GetType();
+            if (t.IsPrimitive || v is decimal) return v;
+            if (t.IsEnum) return v.ToString();
+            // System.Drawing 을 참조에 넣지 않으려고 이름으로 본다
+            if (t.FullName == "System.Drawing.Color")
+            {
+                Func<string, byte> ch = k => (byte)t.GetProperty(k).GetValue(v, null);
+                return "#" + ch("A").ToString("X2") + ch("R").ToString("X2") + ch("G").ToString("X2") + ch("B").ToString("X2");
+            }
+            // MultilingualText — 언어별 글
+            try
+            {
+                var itemsProp = t.GetProperty("Items");
+                if (itemsProp != null && t.Name.Contains("MultilingualText"))
+                {
+                    var texts = new Dictionary<string, object>();
+                    var en = itemsProp.GetValue(v, null) as System.Collections.IEnumerable;
+                    if (en != null)
+                        foreach (var it in en)
+                        {
+                            string culture = null, text = null;
+                            try
+                            {
+                                var lang = it.GetType().GetProperty("Language").GetValue(it, null);
+                                var cul = lang.GetType().GetProperty("Culture").GetValue(lang, null);
+                                culture = cul != null ? cul.ToString() : null;
+                                text = it.GetType().GetProperty("Text").GetValue(it, null) as string;
+                            }
+                            catch { }
+                            if (culture != null) texts[culture] = text;
+                        }
+                    return texts;
+                }
+            }
+            catch { }
+            return v.ToString();
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  Unified 화면 생성 · 수정
+        //
+        //  POST /api/hmi-unified/screen?hmi=<장치>
+        //  본문(JSON) — 조회(GET)가 내놓는 꼴과 같은 이름을 쓴다:
+        //    {
+        //      "group": "test/sub",          ← 없으면 만든다. 생략하면 최상위
+        //      "name":  "T1",                ← 화면 이름. 없으면 만들고, 있으면 고친다
+        //      "Width": 1280, "BackColor": "#FF202020", …        ← Openness 속성 이름 그대로
+        //      "dynamizations": { "BackColor": "태그이름" },      ← 문자열 = 태그 동적화
+        //      "events": { "Loaded": "자바스크립트" },
+        //      "items": [
+        //        { "name": "Start", "type": "HmiButton", "Left": 10, …,
+        //          "Text": "시작",  "Font": { "Size": 20 },
+        //          "dynamizations": { "BackColor": { "type": "Script", "ScriptCode": "…" } },
+        //          "events": { "Tapped": "…" } }
+        //      ]
+        //    }
+        //  소문자 키(group · name · type · typeName · items · dynamizations · events)는 예약이다.
+        //  항목은 이름으로 찾는다 — 있으면 속성만 고치고, 없으면 만든다. 본문에 없는 항목은 그대로 둔다.
+        //  속성 하나가 실패해도 멈추지 않고 failures 에 모은다. **저장(Save)은 하지 않는다.**
+        // ══════════════════════════════════════════════════════════════
+
+        static readonly HashSet<string> UnifiedReserved = new HashSet<string> { "group", "name", "type", "typeName", "items", "dynamizations", "events", "interface" };
+
+        static PropertyInfo UnifiedProp(Type t, string name)
+        {
+            PropertyInfo best = null;
+            foreach (var pi in t.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (pi.Name != name || pi.GetIndexParameters().Length > 0) continue;
+                if (best == null || best.DeclaringType.IsAssignableFrom(pi.DeclaringType)) best = pi;
+            }
+            return best;
+        }
+
+        static object UnifiedCall(object target, string method, params object[] args)
+        {
+            var mi = target.GetType().GetMethods().FirstOrDefault(m => m.Name == method && !m.IsGenericMethod && m.GetParameters().Length == args.Length);
+            if (mi == null) throw new MissingMethodException(target.GetType().Name + "." + method);
+            try { return mi.Invoke(target, args); }
+            catch (TargetInvocationException tie) { throw tie.InnerException ?? tie; }
+        }
+
+        static object UnifiedCreateGeneric(object composition, Type t, params object[] args)
+        {
+            var mi = composition.GetType().GetMethods().FirstOrDefault(m => m.Name == "Create" && m.IsGenericMethod && m.GetParameters().Length == args.Length);
+            if (mi == null) throw new MissingMethodException(composition.GetType().Name + ".Create<T>");
+            try { return mi.MakeGenericMethod(t).Invoke(composition, args); }
+            catch (TargetInvocationException tie) { throw tie.InnerException ?? tie; }
+        }
+
+        static Type UnifiedType(string name)
+        {
+            var asm = typeof(HmiScreen).Assembly;
+            Type[] types;
+            try { types = asm.GetTypes(); } catch (ReflectionTypeLoadException ex) { types = ex.Types.Where(x => x != null).ToArray(); }
+            return types.FirstOrDefault(x => x.IsPublic && (x.Name == name || x.Name == "Hmi" + name));
+        }
+
+        static object UnifiedConvert(object v, Type target)
+        {
+            if (v == null) return null;
+            var nn = Nullable.GetUnderlyingType(target);
+            if (nn != null) target = nn;
+            if (target.IsInstanceOfType(v)) return v;
+            if (target.IsEnum) return Enum.Parse(target, v.ToString(), true);
+            if (target == typeof(string)) return v.ToString();
+            if (target.FullName == "System.Drawing.Color")
+            {
+                string h = v.ToString().TrimStart('#');
+                if (h.Length == 6) h = "FF" + h;
+                if (h.Length != 8) throw new FormatException("색은 #AARRGGBB 또는 #RRGGBB: " + v);
+                int a = Convert.ToInt32(h.Substring(0, 2), 16), r = Convert.ToInt32(h.Substring(2, 2), 16), g = Convert.ToInt32(h.Substring(4, 2), 16), b = Convert.ToInt32(h.Substring(6, 2), 16);
+                return target.GetMethod("FromArgb", new[] { typeof(int), typeof(int), typeof(int), typeof(int) }).Invoke(null, new object[] { a, r, g, b });
+            }
+            return Convert.ChangeType(v, target, System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        // 다국어 글 — 문자열이면 모든 언어에, { "ko-KR": "…" } 이면 그 언어에만
+        static void UnifiedSetText(object mlText, object value)
+        {
+            var en = mlText.GetType().GetProperty("Items").GetValue(mlText, null) as System.Collections.IEnumerable;
+            var per = value as Dictionary<string, object>;
+            foreach (var it in en)
+            {
+                var textProp = it.GetType().GetProperty("Text");
+                if (per == null) { textProp.SetValue(it, value == null ? "" : value.ToString(), null); continue; }
+                var lang = it.GetType().GetProperty("Language").GetValue(it, null);
+                var cul = lang.GetType().GetProperty("Culture").GetValue(lang, null);
+                object tv;
+                if (cul != null && per.TryGetValue(cul.ToString(), out tv)) textProp.SetValue(it, tv == null ? "" : tv.ToString(), null);
+            }
+        }
+
+        static int ApplyUnifiedProps(IEngineeringObject obj, Dictionary<string, object> props, string where, List<object> failures)
+        {
+            int set = 0;
+            foreach (var kv in props)
+            {
+                if (UnifiedReserved.Contains(kv.Key)) continue;
+                try
+                {
+                    var pi = UnifiedProp(obj.GetType(), kv.Key);
+                    if (pi != null && pi.PropertyType.Name.Contains("MultilingualText"))
+                    {
+                        UnifiedSetText(pi.GetValue(obj, null), kv.Value);
+                        set++;
+                        continue;
+                    }
+                    var nested = kv.Value as Dictionary<string, object>;
+                    if (nested != null)
+                    {
+                        var part = obj.GetAttribute(kv.Key) as IEngineeringObject;
+                        if (part == null) throw new InvalidOperationException("파트가 아니다");
+                        set += ApplyUnifiedProps(part, nested, where + "." + kv.Key, failures);
+                        continue;
+                    }
+                    object val = pi != null ? UnifiedConvert(kv.Value, pi.PropertyType) : kv.Value;
+                    obj.SetAttribute(kv.Key, val);
+                    set++;
+                }
+                catch (Exception ex)
+                {
+                    var inner = ex is TargetInvocationException && ex.InnerException != null ? ex.InnerException : ex;
+                    failures.Add(new { where, key = kv.Key, error = inner.Message });
+                }
+            }
+            return set;
+        }
+
+        static int ApplyUnifiedDynamizations(IEngineeringObject obj, object spec, string where, List<object> failures)
+        {
+            var dict = spec as Dictionary<string, object>;
+            if (dict == null) return 0;
+            int n = 0;
+            var comp = UnifiedProp(obj.GetType(), "Dynamizations").GetValue(obj, null);
+            foreach (var kv in dict)
+            {
+                try
+                {
+                    var old = UnifiedCall(comp, "Find", kv.Key);
+                    if (old != null) UnifiedCall(old, "Delete");
+                    if (kv.Value == null) { n++; continue; }
+                    var d = kv.Value as Dictionary<string, object>;
+                    string kind = d != null && d.ContainsKey("type") ? d["type"].ToString() : "Tag";
+                    var t = UnifiedType(kind.EndsWith("Dynamization") ? kind : kind + "Dynamization");
+                    if (t == null) throw new InvalidOperationException("모르는 동적화 종류: " + kind);
+                    var dyn = (IEngineeringObject)UnifiedCreateGeneric(comp, t, kv.Key);
+                    if (d == null) dyn.SetAttribute("Tag", kv.Value.ToString());
+                    else ApplyUnifiedProps(dyn, d, where + ".dynamizations." + kv.Key, failures);
+                    n++;
+                }
+                catch (Exception ex) { failures.Add(new { where, key = "dynamizations." + kv.Key, error = ex.Message }); }
+            }
+            return n;
+        }
+
+        static int ApplyUnifiedEvents(IEngineeringObject obj, object spec, string where, List<object> failures)
+        {
+            var dict = spec as Dictionary<string, object>;
+            if (dict == null) return 0;
+            int n = 0;
+            var comp = UnifiedProp(obj.GetType(), "EventHandlers").GetValue(obj, null);
+            var create = comp.GetType().GetMethods().First(m => m.Name == "Create" && m.GetParameters().Length == 1);
+            var enumType = create.GetParameters()[0].ParameterType;
+            foreach (var kv in dict)
+            {
+                try
+                {
+                    object ev = Enum.Parse(enumType, kv.Key, true);
+                    var handler = UnifiedCall(comp, "Find", ev);
+                    if (kv.Value == null) { if (handler != null) UnifiedCall(handler, "Delete"); n++; continue; }
+                    if (handler == null) handler = UnifiedCall(comp, "Create", ev);
+                    var script = (IEngineeringObject)UnifiedProp(handler.GetType(), "Script").GetValue(handler, null);
+                    var d = kv.Value as Dictionary<string, object>;
+                    if (d != null) ApplyUnifiedProps(script, d, where + ".events." + kv.Key, failures);
+                    else script.SetAttribute("ScriptCode", kv.Value.ToString());
+                    n++;
+                }
+                catch (Exception ex) { failures.Add(new { where, key = "events." + kv.Key, error = ex.Message }); }
+            }
+            return n;
+        }
+
+        // 그룹 경로 → 화면 컴포지션. create 면 없는 그룹을 만든다
+        static object UnifiedScreensAt(HmiSoftware hmi, string groupPath, bool create, List<string> createdGroups)
+        {
+            if (string.IsNullOrEmpty(groupPath)) return hmi.Screens;
+            object groups = hmi.ScreenGroups;
+            object group = null;
+            foreach (var part in groupPath.Split('/'))
+            {
+                group = UnifiedCall(groups, "Find", part);
+                if (group == null)
+                {
+                    if (!create) return null;
+                    group = UnifiedCall(groups, "Create", part);
+                    if (createdGroups != null) createdGroups.Add(part);
+                }
+                groups = group.GetType().GetProperty("Groups").GetValue(group, null);
+            }
+            return group.GetType().GetProperty("Screens").GetValue(group, null);
+        }
+
+        static void ApplyUnifiedScreen(HttpListenerContext ctx, HmiSoftware hmi)
+        {
+            var body = ReadJsonBody(ctx);
+            if (body == null || !body.ContainsKey("name")) { SendJson(ctx.Response, 400, new { error = "본문에 name(화면 이름)이 필요하다" }); return; }
+            string name = body["name"].ToString();
+            string groupPath = body.ContainsKey("group") && body["group"] != null ? body["group"].ToString() : "";
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var failures = new List<object>();
+            var createdGroups = new List<string>();
+            try
+            {
+                var screens = UnifiedScreensAt(hmi, groupPath, true, createdGroups);
+                var screen = UnifiedCall(screens, "Find", name) as HmiScreen;
+                bool screenCreated = screen == null;
+                if (screen == null) screen = (HmiScreen)UnifiedCall(screens, "Create", name);
+
+                int set = ApplyUnifiedProps(screen, body, "screen", failures);
+                object spec;
+                int dyn = body.TryGetValue("dynamizations", out spec) ? ApplyUnifiedDynamizations(screen, spec, "screen", failures) : 0;
+                int evt = body.TryGetValue("events", out spec) ? ApplyUnifiedEvents(screen, spec, "screen", failures) : 0;
+
+                int created = 0, updated = 0;
+                object itemsObj;
+                if (body.TryGetValue("items", out itemsObj) && itemsObj is System.Collections.IEnumerable)
+                {
+                    foreach (var raw in (System.Collections.IEnumerable)itemsObj)
+                    {
+                        var it = raw as Dictionary<string, object>;
+                        if (it == null || !it.ContainsKey("name")) { failures.Add(new { where = "items", key = "name", error = "항목에 name 이 없다" }); continue; }
+                        string iname = it["name"].ToString();
+                        string where = "items." + iname;
+                        try
+                        {
+                            var item = UnifiedCall(screen.ScreenItems, "Find", iname) as IEngineeringObject;
+                            if (item == null)
+                            {
+                                if (!it.ContainsKey("type")) throw new InvalidOperationException("새 항목에는 type 이 필요하다");
+                                var t = UnifiedType(it["type"].ToString());
+                                if (t == null) throw new InvalidOperationException("모르는 항목 종류: " + it["type"]);
+                                item = it.ContainsKey("typeName")
+                                    ? (IEngineeringObject)UnifiedCreateGeneric(screen.ScreenItems, t, iname, it["typeName"].ToString())
+                                    : (IEngineeringObject)UnifiedCreateGeneric(screen.ScreenItems, t, iname);
+                                created++;
+                            }
+                            else updated++;
+                            set += ApplyUnifiedProps(item, it, where, failures);
+                            if (it.TryGetValue("dynamizations", out spec)) dyn += ApplyUnifiedDynamizations(item, spec, where, failures);
+                            if (it.TryGetValue("events", out spec)) evt += ApplyUnifiedEvents(item, spec, where, failures);
+                            if (it.TryGetValue("interface", out spec)) set += ApplyUnifiedInterface(item, spec, where, failures);
+                        }
+                        catch (Exception ex) { failures.Add(new { where, key = "(create)", error = ex.Message }); }
+                    }
+                }
+                SendJson(ctx.Response, 200, new
+                {
+                    hmi = SafeAttr(hmi, "Name"),
+                    path = (groupPath == "" ? "" : groupPath + "/") + name,
+                    screenCreated,
+                    groupsCreated = createdGroups,
+                    itemsCreated = created,
+                    itemsUpdated = updated,
+                    propertiesSet = set,
+                    dynamizations = dyn,
+                    events = evt,
+                    failureCount = failures.Count,
+                    failures,
+                    elapsedMs = sw.ElapsedMilliseconds,
+                    saved = false
+                });
+            }
+            catch (Exception ex)
+            {
+                SendJson(ctx.Response, 500, new { error = ex.Message, failures, elapsedMs = sw.ElapsedMilliseconds });
+            }
+        }
+
+        // DELETE /api/hmi-unified/screen?hmi=&screen=<그룹/화면>[&item=<항목>]
+        static void DeleteUnifiedScreen(HttpListenerContext ctx, HmiSoftware hmi)
+        {
+            string path = ctx.Request.QueryString["screen"];
+            string itemName = ctx.Request.QueryString["item"];
+            var screen = FindUnifiedScreenByPath(hmi, path) as HmiScreen;
+            if (screen == null) { SendJson(ctx.Response, 404, new { error = "Screen not found: " + path }); return; }
+            try
+            {
+                if (!string.IsNullOrEmpty(itemName))
+                {
+                    var item = UnifiedCall(screen.ScreenItems, "Find", itemName);
+                    if (item == null) { SendJson(ctx.Response, 404, new { error = "Item not found: " + itemName }); return; }
+                    UnifiedCall(item, "Delete");
+                    SendJson(ctx.Response, 200, new { deleted = "item", path, item = itemName });
+                    return;
+                }
+                UnifiedCall(screen, "Delete");
+                SendJson(ctx.Response, 200, new { deleted = "screen", path });
+            }
+            catch (Exception ex) { SendJson(ctx.Response, 500, new { error = ex.Message }); }
+        }
+
+        // DELETE /api/hmi-unified/screen-group?hmi=&group=<경로> — 비어 있지 않으면 거절한다
+        static void DeleteUnifiedScreenGroup(HttpListenerContext ctx, HmiSoftware hmi)
+        {
+            string path = ctx.Request.QueryString["group"];
+            if (string.IsNullOrEmpty(path)) { SendJson(ctx.Response, 400, new { error = "Missing ?group=" }); return; }
+            try
+            {
+                object groups = hmi.ScreenGroups, group = null;
+                foreach (var part in path.Split('/'))
+                {
+                    group = UnifiedCall(groups, "Find", part);
+                    if (group == null) { SendJson(ctx.Response, 404, new { error = "Group not found: " + path }); return; }
+                    groups = group.GetType().GetProperty("Groups").GetValue(group, null);
+                }
+                int screens = 0, subs = 0;
+                foreach (var x in (System.Collections.IEnumerable)group.GetType().GetProperty("Screens").GetValue(group, null)) screens++;
+                foreach (var x in (System.Collections.IEnumerable)groups) subs++;
+                if (screens > 0 || subs > 0) { SendJson(ctx.Response, 409, new { error = "그룹이 비어 있지 않다", screens, subGroups = subs }); return; }
+                UnifiedCall(group, "Delete");
+                SendJson(ctx.Response, 200, new { deleted = "group", path });
+            }
+            catch (Exception ex) { SendJson(ctx.Response, 500, new { error = ex.Message }); }
+        }
+
+        // 페이스플레이트 · 커스텀 위젯의 인터페이스 — { "속성": 값 } 또는 { "속성": { "Value": 값, "dynamizations": {…} } }
+        // 인터페이스 속성은 타입이 정한다. 만들 수는 없고 있는 것을 찾아 값을 넣는다.
+        static int ApplyUnifiedInterface(IEngineeringObject item, object spec, string where, List<object> failures)
+        {
+            var dict = spec as Dictionary<string, object>;
+            if (dict == null) return 0;
+            int n = 0;
+            var pi = UnifiedProp(item.GetType(), "Interface");
+            if (pi == null) { failures.Add(new { where, key = "interface", error = "이 항목에는 인터페이스가 없다" }); return 0; }
+            var comp = pi.GetValue(item, null);
+            foreach (var kv in dict)
+            {
+                try
+                {
+                    var entry = UnifiedCall(comp, "Find", kv.Key) as IEngineeringObject;
+                    if (entry == null) throw new InvalidOperationException("인터페이스 속성이 없다");
+                    var d = kv.Value as Dictionary<string, object>;
+                    if (d == null) { entry.SetAttribute("Value", kv.Value); n++; continue; }
+                    object v;
+                    if (d.TryGetValue("Value", out v)) { entry.SetAttribute("Value", v); n++; }
+                    if (d.TryGetValue("dynamizations", out v)) n += ApplyUnifiedDynamizations(entry, v, where + ".interface." + kv.Key, failures);
+                }
+                catch (Exception ex) { failures.Add(new { where, key = "interface." + kv.Key, error = ex.Message }); }
+            }
+            return n;
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  GET /api/hmi-unified/item-types?hmi=<장치>
+        //
+        //  화면 항목 종류와 속성 표 — Openness 어셈블리를 리플렉션해서 만든다(프로젝트를 읽지 않는다).
+        //  바깥의 편집기가 "이 종류에는 어떤 속성이 있고 어떤 값을 받는가" 를 여기서 얻는다.
+        //  원은 Left/Top 이 아니라 CenterX/CenterY/Radius 다 — 종류마다 다르다.
+        // ══════════════════════════════════════════════════════════════
+        static void ListUnifiedItemTypes(HttpListenerContext ctx)
+        {
+            var asm = typeof(HmiScreen).Assembly;
+            Type[] types;
+            try { types = asm.GetTypes(); } catch (ReflectionTypeLoadException ex) { types = ex.Types.Where(x => x != null).ToArray(); }
+            var baseType = types.FirstOrDefault(x => x.Name == "HmiScreenItemBase");
+            var enums = new SortedDictionary<string, object>();
+            var parts = new SortedDictionary<string, object>();
+            Func<Type, object> describe = null;
+            describe = t =>
+            {
+                var props = new SortedDictionary<string, object>();
+                foreach (var pi in t.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    if (pi.Name == "Parent" || pi.GetIndexParameters().Length > 0) continue;
+                    var pt = Nullable.GetUnderlyingType(pi.PropertyType) ?? pi.PropertyType;
+                    string kind;
+                    if (pt.IsEnum)
+                    {
+                        kind = "enum:" + pt.Name;
+                        if (!enums.ContainsKey(pt.Name)) enums[pt.Name] = new { flags = pt.IsDefined(typeof(FlagsAttribute), false), values = Enum.GetNames(pt) };
+                    }
+                    else if (pt.FullName == "System.Drawing.Color") kind = "color";
+                    else if (pt.Name.Contains("MultilingualText")) kind = "text";
+                    else if (pt.Name.EndsWith("Composition")) kind = "list:" + pt.Name;
+                    else if (pt.Name.EndsWith("Part") || (typeof(IEngineeringObject).IsAssignableFrom(pt) && pt.Assembly == asm))
+                    {
+                        kind = "part:" + pt.Name;
+                        if (!parts.ContainsKey(pt.Name)) { parts[pt.Name] = null; parts[pt.Name] = describe(pt); }
+                    }
+                    else kind = pt.Name;
+                    props[pi.Name] = pi.CanWrite ? kind : kind + " (읽기 전용)";
+                }
+                return props;
+            };
+            var items = new SortedDictionary<string, object>();
+            foreach (var t in types)
+            {
+                if (!t.IsPublic || t.IsAbstract || baseType == null || !baseType.IsAssignableFrom(t)) continue;
+                string events = null;
+                var eh = UnifiedProp(t, "EventHandlers");
+                if (eh != null)
+                {
+                    var create = eh.PropertyType.GetMethods().FirstOrDefault(m => m.Name == "Create" && m.GetParameters().Length == 1);
+                    if (create != null && create.GetParameters()[0].ParameterType.IsEnum) events = string.Join(",", Enum.GetNames(create.GetParameters()[0].ParameterType).Where(x => x != "None"));
+                }
+                items[t.Name] = new { ns = t.Namespace.Substring(t.Namespace.LastIndexOf('.') + 1), events, properties = describe(t) };
+            }
+            SendJson(ctx.Response, 200, new { assembly = asm.GetName().Name, version = asm.GetName().Version.ToString(), count = items.Count, items, parts, enums });
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  GET /api/hmi-unified/resources?hmi=<장치>
+        //
+        //  화면이 이름으로 가리키는 것들 — 프로젝트 그래픽, 프로젝트 라이브러리의 타입(페이스플레이트 등)과 버전.
+        //  HmiGraphicView.Graphic = 그래픽 이름,  HmiFaceplateContainer.ContainedType = "V<버전>\\<타입 이름>"
+        // ══════════════════════════════════════════════════════════════
+        static void ListUnifiedResources(HttpListenerContext ctx, HmiSoftware hmi)
+        {
+            var errors = new List<string>();
+            var graphics = new List<string>();
+            var libTypes = new List<object>();
+            try
+            {
+                foreach (Project proj in connectedPortal.Projects)
+                {
+                    try
+                    {
+                        var en = UnifiedProjectGraphics(proj);
+                        if (en != null) foreach (var g in en) graphics.Add(SafeAttr(g, "Name"));
+                        else errors.Add("Graphics: 프로젝트 그래픽 컬렉션을 찾지 못했다");
+                    }
+                    catch (Exception ex) { errors.Add("Graphics: " + ex.Message); }
+                    try { CollectLibraryTypes(proj.ProjectLibrary.TypeFolder, "", libTypes, errors); }
+                    catch (Exception ex) { errors.Add("ProjectLibrary: " + ex.Message); }
+                    break;
+                }
+            }
+            catch (Exception ex) { errors.Add(ex.Message); }
+            SendJson(ctx.Response, 200, new { graphicsCount = graphics.Count, graphics, libraryTypeCount = libTypes.Count, libraryTypes = libTypes, errors });
+        }
+
+        static void CollectLibraryTypes(object folder, string path, List<object> acc, List<string> errors)
+        {
+            try
+            {
+                var types = folder.GetType().GetProperty("Types").GetValue(folder, null) as System.Collections.IEnumerable;
+                foreach (var t in types)
+                {
+                    var versions = new List<object>();
+                    try
+                    {
+                        var vs = t.GetType().GetProperty("Versions").GetValue(t, null) as System.Collections.IEnumerable;
+                        foreach (var v in vs)
+                        {
+                            object vn = null, state = null;
+                            try { vn = v.GetType().GetProperty("VersionNumber").GetValue(v, null); } catch { }
+                            try { state = v.GetType().GetProperty("State").GetValue(v, null); } catch { }
+                            versions.Add(new { version = vn != null ? vn.ToString() : null, state = state != null ? state.ToString() : null });
+                        }
+                    }
+                    catch (Exception ex) { errors.Add("Versions: " + ex.Message); }
+                    acc.Add(new { name = SafeAttr(t, "Name"), folder = path, kind = t.GetType().Name, versions });
+                }
+                var folders = folder.GetType().GetProperty("Folders").GetValue(folder, null) as System.Collections.IEnumerable;
+                foreach (var f in folders) CollectLibraryTypes(f, (path == "" ? "" : path + "/") + SafeAttr(f, "Name"), acc, errors);
+            }
+            catch (Exception ex) { errors.Add("TypeFolder " + path + ": " + ex.Message); }
+        }
+
+        // 프로젝트 그래픽 컬렉션 — V20 까지는 project.Graphics, V21 은 GraphicsProvider 서비스의 Graphics.
+        // 두 버전에서 같은 소스로 컴파일되도록 이름으로 찾는다.
+        static System.Collections.IEnumerable UnifiedProjectGraphics(Project proj)
+        {
+            var gp = proj.GetType().GetProperty("Graphics");
+            if (gp != null)
+            {
+                var direct = gp.GetValue(proj, null) as System.Collections.IEnumerable;
+                if (direct != null) return direct;
+            }
+            Type provider = null;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try { provider = asm.GetType("Siemens.Engineering.Hmi.Globalization.GraphicsProvider"); } catch { }
+                if (provider != null) break;
+            }
+            if (provider == null)
+            {
+                // WinCC 어셈블리가 아직 안 올라왔을 수 있다 — 같은 어셈블리의 타입 하나로 끌어온다
+                try { provider = typeof(HmiTarget).Assembly.GetType("Siemens.Engineering.Hmi.Globalization.GraphicsProvider"); } catch { }
+            }
+            if (provider == null) return null;
+            var getService = typeof(IEngineeringServiceProvider).GetMethod("GetService").MakeGenericMethod(provider);
+            var svc = getService.Invoke(proj, null);
+            if (svc == null) return null;
+            return svc.GetType().GetProperty("Graphics").GetValue(svc, null) as System.Collections.IEnumerable;
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  GET /api/hmi-unified/graphics/export?hmi=<장치>&dir=<폴더>[&names=a,b]
+        //
+        //  프로젝트 그래픽을 폴더로 내보낸다(그래픽마다 XML + 그림 파일). 바깥의 편집기가 팔레트에 쓸 그림이다.
+        //  프로젝트는 바꾸지 않는다. 폴더는 없으면 만들고, 같은 이름의 파일은 덮어쓴다.
+        // ══════════════════════════════════════════════════════════════
+        static void ExportUnifiedGraphics(HttpListenerContext ctx, HmiSoftware hmi)
+        {
+            string dir = ctx.Request.QueryString["dir"];
+            if (string.IsNullOrEmpty(dir)) { SendJson(ctx.Response, 400, new { error = "Missing ?dir= (내보낼 폴더)" }); return; }
+            var only = (ctx.Request.QueryString["names"] ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var done = new List<object>();
+            var failed = new List<object>();
+            try
+            {
+                Directory.CreateDirectory(dir);
+                Project proj = null;
+                foreach (Project pr in connectedPortal.Projects) { proj = pr; break; }
+                var en = UnifiedProjectGraphics(proj);
+                if (en == null) { SendJson(ctx.Response, 500, new { error = "프로젝트 그래픽 컬렉션을 찾지 못했다" }); return; }
+                foreach (var g in en)
+                {
+                    string name = SafeAttr(g, "Name");
+                    if (only.Length > 0 && !only.Contains(name)) continue;
+                    try
+                    {
+                        string safe = string.Concat(name.Select(ch => Path.GetInvalidFileNameChars().Contains(ch) ? '_' : ch));
+                        var fi = new FileInfo(Path.Combine(dir, safe + ".xml"));
+                        if (fi.Exists) fi.Delete();
+                        var export = g.GetType().GetMethod("Export", new[] { typeof(FileInfo), typeof(ExportOptions) });
+                        try { export.Invoke(g, new object[] { fi, ExportOptions.WithDefaults }); }
+                        catch (TargetInvocationException tie) { throw tie.InnerException ?? tie; }
+                        done.Add(new { name, file = fi.Name });
+                    }
+                    catch (Exception ex) { failed.Add(new { name, error = ex.Message }); }
+                }
+                SendJson(ctx.Response, 200, new { dir, exported = done.Count, failedCount = failed.Count, graphics = done, failed, elapsedMs = sw.ElapsedMilliseconds });
+            }
+            catch (Exception ex) { SendJson(ctx.Response, 500, new { error = ex.Message, exported = done.Count, failed }); }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  GET /api/hmi-unified/faceplates?hmi=<장치>[&probe=true][&filter=<이름 일부>]
+        //
+        //  프로젝트 라이브러리의 페이스플레이트 타입 목록. ContainedType 은 "V<버전>\\<이름>" 이다.
+        //
+        //  probe=true — 인터페이스 속성 이름과 기본 크기까지 알아낸다. 타입만 보고는 알 수 없어서
+        //  **임시 화면을 하나 만들어 컨테이너를 놓아 보고 읽은 뒤 지운다.** 끝나면 임시 화면도 지운다
+        //  (프로젝트를 잠깐 바꾼다 — 저장은 하지 않는다). 컨테이너로 놓을 수 없는 타입은 faceplate:false 로 나온다.
+        // ══════════════════════════════════════════════════════════════
+        static void ListUnifiedFaceplates(HttpListenerContext ctx, HmiSoftware hmi)
+        {
+            bool probe = (ctx.Request.QueryString["probe"] ?? "") == "true";
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var errors = new List<string>();
+            var result = ProbeUnifiedFaceplates(hmi, probe, ctx.Request.QueryString["filter"], errors);
+            SendJson(ctx.Response, 200, new { count = result.Count, probed = probe, faceplates = result, errors, elapsedMs = sw.ElapsedMilliseconds });
+        }
+
+        static List<object> ProbeUnifiedFaceplates(HmiSoftware hmi, bool probe, string filter, List<string> errors)
+        {
+            var all = new List<object>();
+            Project proj = null;
+            foreach (Project pr in connectedPortal.Projects) { proj = pr; break; }
+            CollectLibraryTypes(proj.ProjectLibrary.TypeFolder, "", all, errors);
+
+            HmiScreen probeScreen = null;
+            string probeName = "__probe_" + DateTime.Now.ToString("HHmmss");
+            var result = new List<object>();
+            try
+            {
+                if (probe) probeScreen = hmi.Screens.Create(probeName);
+                int idx = 0;
+                foreach (var o in all)
+                {
+                    var t = o.GetType();
+                    string kind = (string)t.GetProperty("kind").GetValue(o, null);
+                    if (kind != "LibraryType") continue; // PLC 타입 · 코드 블록 · 스타일은 뺀다
+                    string name = (string)t.GetProperty("name").GetValue(o, null);
+                    if (!string.IsNullOrEmpty(filter) && (name == null || name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)) continue;
+                    string folder = (string)t.GetProperty("folder").GetValue(o, null);
+                    var versions = ((List<object>)t.GetProperty("versions").GetValue(o, null))
+                        .Select(v => (string)v.GetType().GetProperty("version").GetValue(v, null)).Where(v => v != null).ToList();
+                    string latest = versions.OrderBy(v => { Version pv; return Version.TryParse(v, out pv) ? pv : new Version(0, 0); }).LastOrDefault();
+                    string contained = latest != null ? "V" + latest + "\\" + name : null;
+                    if (!probe || contained == null) { result.Add(new { name, folder, versions, latest, containedType = contained }); continue; }
+
+                    bool ok = false; string why = null; object width = null, height = null;
+                    var iface = new List<object>();
+                    try
+                    {
+                        var ft = UnifiedType("HmiFaceplateContainer");
+                        var item = (IEngineeringObject)UnifiedCreateGeneric(probeScreen.ScreenItems, ft, "p" + (idx++), contained);
+                        ok = true;
+                        try { width = item.GetAttribute("Width"); height = item.GetAttribute("Height"); } catch { }
+                        try
+                        {
+                            var comp = UnifiedProp(item.GetType(), "Interface").GetValue(item, null) as System.Collections.IEnumerable;
+                            foreach (var e in comp)
+                            {
+                                var eo = (IEngineeringObject)e;
+                                object val = null;
+                                try { val = eo.GetAttribute("Value"); } catch { }
+                                iface.Add(new { name = SafeAttr(eo, "PropertyName"), valueType = val != null ? val.GetType().Name : null, defaultValue = UnifiedValue(val) });
+                            }
+                        }
+                        catch (Exception ex) { why = "Interface: " + ex.Message; }
+                        try { UnifiedCall(item, "Delete"); } catch { }
+                    }
+                    catch (Exception ex) { why = ex.Message; }
+                    result.Add(new { name, folder, versions, latest, containedType = contained, faceplate = ok, width, height, @interface = iface, note = why });
+                }
+            }
+            finally
+            {
+                if (probeScreen != null)
+                {
+                    try { UnifiedCall(probeScreen, "Delete"); }
+                    catch (Exception ex) { errors.Add("임시 화면 " + probeName + " 을 지우지 못했다 — 직접 지울 것: " + ex.Message); }
+                }
+            }
+            return result;
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  GET /api/hmi-unified/catalog/export?hmi=<장치>&dir=<폴더>
+        //
+        //  바깥의 화면 편집기가 도구 모음에 쓸 **카탈로그 폴더**를 한 번에 만든다:
+        //      <dir>/catalog.json            그래픽 이름 → 그림 파일, 페이스플레이트(타입 · 기본 크기 · 인터페이스)
+        //      <dir>/graphics/<이름>.xml  ·  <dir>/graphics/<이름> files/<그림>
+        //  페이스플레이트는 임시 화면에 놓아 보고 읽는다(끝나면 지운다 — 저장하지 않는다). 타입이 많으면 몇 분 걸린다.
+        // ══════════════════════════════════════════════════════════════
+        static void ExportUnifiedCatalog(HttpListenerContext ctx, HmiSoftware hmi)
+        {
+            string dir = ctx.Request.QueryString["dir"];
+            if (string.IsNullOrEmpty(dir)) { SendJson(ctx.Response, 400, new { error = "Missing ?dir= (카탈로그를 만들 폴더)" }); return; }
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var errors = new List<string>();
+            try
+            {
+                string gdir = Path.Combine(dir, "graphics");
+                Directory.CreateDirectory(gdir);
+                Project proj = null;
+                foreach (Project pr in connectedPortal.Projects) { proj = pr; break; }
+
+                var graphics = new List<object>();
+                var en = UnifiedProjectGraphics(proj);
+                if (en == null) errors.Add("프로젝트 그래픽 컬렉션을 찾지 못했다");
+                else foreach (var g in en)
+                {
+                    string name = SafeAttr(g, "Name");
+                    try
+                    {
+                        string safe = string.Concat(name.Select(ch => Path.GetInvalidFileNameChars().Contains(ch) ? '_' : ch));
+                        var fi = new FileInfo(Path.Combine(gdir, safe + ".xml"));
+                        if (fi.Exists) fi.Delete();
+                        var export = g.GetType().GetMethod("Export", new[] { typeof(FileInfo), typeof(ExportOptions) });
+                        try { export.Invoke(g, new object[] { fi, ExportOptions.WithDefaults }); }
+                        catch (TargetInvocationException tie) { throw tie.InnerException ?? tie; }
+                        // 그림은 "<이름> files" 폴더에 나온다 — 기본 언어의 그림(DefaultImageStream.*)을 고른다
+                        string filesDir = Path.Combine(gdir, safe + " files");
+                        string image = null;
+                        if (Directory.Exists(filesDir))
+                        {
+                            var imgs = Directory.GetFiles(filesDir).Select(Path.GetFileName).OrderBy(x => x).ToList();
+                            string pick = imgs.FirstOrDefault(x => x.StartsWith("DefaultImageStream")) ?? imgs.FirstOrDefault();
+                            if (pick != null) image = "graphics/" + safe + " files/" + pick;
+                        }
+                        graphics.Add(new { name, image });
+                    }
+                    catch (Exception ex) { errors.Add("그래픽 " + name + ": " + ex.Message); }
+                }
+
+                var faceplates = new List<object>();
+                foreach (var o in ProbeUnifiedFaceplates(hmi, true, null, errors))
+                {
+                    var t = o.GetType();
+                    var ok = t.GetProperty("faceplate");
+                    if (ok == null || !(bool)ok.GetValue(o, null)) continue;
+                    var iface = new List<object>();
+                    foreach (var i in (List<object>)t.GetProperty("interface").GetValue(o, null))
+                        iface.Add(new { name = i.GetType().GetProperty("name").GetValue(i, null), valueType = i.GetType().GetProperty("valueType").GetValue(i, null) });
+                    faceplates.Add(new
+                    {
+                        name = t.GetProperty("name").GetValue(o, null),
+                        containedType = t.GetProperty("containedType").GetValue(o, null),
+                        folder = t.GetProperty("folder").GetValue(o, null),
+                        width = t.GetProperty("width").GetValue(o, null),
+                        height = t.GetProperty("height").GetValue(o, null),
+                        @interface = iface
+                    });
+                }
+
+                var catalog = new { format = "unified-hmi-catalog", version = 1, graphics, faceplates };
+                string file = Path.Combine(dir, "catalog.json");
+                File.WriteAllText(file, json.Serialize(catalog), new UTF8Encoding(false));
+                SendJson(ctx.Response, 200, new { dir, file, graphics = graphics.Count, faceplates = faceplates.Count, errors, elapsedMs = sw.ElapsedMilliseconds });
+            }
+            catch (Exception ex) { SendJson(ctx.Response, 500, new { error = ex.Message, errors }); }
         }
 
         static object BuildUnifiedHmiConnectionInfo(HmiConnection c)
