@@ -2,7 +2,8 @@
 
 TIA Portal 밖(웹 편집기 등)에서 화면을 정의하고, TiaApiServer 의 REST API 로
 TIA 프로젝트에 **네이티브 Unified 화면**으로 넣는 흐름이다. 2026-11-10 에
-TIA Portal V21, MTP1200 Unified Comfort 패널 프로젝트에서 끝까지 해 본 결과다.
+TIA Portal V21, MTP1200 Unified Comfort 패널 프로젝트에서 끝까지 해 봤고, 2026-11-12 에
+나머지 Unified 모델 · 그림 넣기 · 이벤트를 같은 방법으로 확인했다(7장).
 
 이 문서의 이름(`OP01`, `fpCylinder`, `Tank1_Level` …)은 설명용으로 지은 것이다.
 
@@ -183,7 +184,7 @@ curl -X DELETE -G "http://localhost:8099/api/hmi-unified/screen-group" --data-ur
 ## 4. 화면 JSON
 
 조회(GET)가 내놓는 이름과 넣기(POST)가 받는 이름이 같다 — **Openness 속성 이름 그대로**다.
-소문자 키는 예약이다: `group` · `name` · `type` · `typeName` · `items` · `dynamizations` · `events` · `interface`.
+소문자 키는 예약이다: `group` · `name` · `model` · `type` · `typeName` · `items` · `dynamizations` · `events` · `interface` · `graphics` · `prune`.
 
 ```json
 {
@@ -227,6 +228,10 @@ curl -X DELETE -G "http://localhost:8099/api/hmi-unified/screen-group" --data-ur
 | 연결 지우기 | `"dynamizations": { "<속성>": null }` |
 | 이벤트 | `"events": { "Tapped": "<자바스크립트>" }` — 이벤트 이름은 `item-types` 의 `events` |
 | 그래픽 | `"Graphic": "<프로젝트 그래픽 이름>"` |
+| 그림 함께 넣기 | 최상위 `"graphics": [ { "name": "Logo", "file": "logo.svg", "data": "<base64>" } ]` — 화면보다 먼저 프로젝트 그래픽으로 들어간다 |
+| 화면 이벤트 | 최상위 `"events": { "Loaded": "<자바스크립트>" }` — `Loaded` · `Unloaded` · `Tapped` · `ContextTapped` |
+| 통째로 맞추기 | 최상위 `"prune": true` — 본문의 `items` 에 없는 항목을 화면에서 지운다 |
+| 모델 표시 | 최상위 `"model"` 은 편집기가 다시 읽을 때 쓰는 표식이다. 서버는 읽지 않는다 |
 | 페이스플레이트 | 만들 때 `"typeName": "V<버전>\\<타입 이름>"`, 값은 `"interface": { "<속성>": "<HMI 태그 이름>" }` |
 
 ---
@@ -255,9 +260,85 @@ curl -X DELETE -G "http://localhost:8099/api/hmi-unified/screen-group" --data-ur
 ## 6. 남은 일
 
 - 넣기 전 검사: 그래픽 이름 · 페이스플레이트 타입 · 태그 이름이 대상 프로젝트에 있는가.
-- 본문에 없는 항목을 지우는 "통째로 맞추기" 선택지(지금은 더하고 고치기만 한다).
 - 다각형의 `Points`, 화면 창, 트렌드 축 같은 목록형 속성의 쓰기.
 - 카탈로그에 HMI 태그 목록 싣기(편집기가 태그 이름을 검사하고 고르게 할 수 있다).
 - 편집기: 기존 화면(GET 꼴) 불러오기, 여러 항목 선택 · 정렬, emf 그림 미리보기.
 - Swagger 문서(`openapi.json`)에 이 엔드포인트들을 싣기.
 - V20 빌드에서의 확인(코드는 리플렉션으로 써서 같은 소스로 컴파일되지만 돌려 보지 않았다).
+
+---
+
+## 7. 2026-11-12 에 더 확인한 것
+
+같은 V21 프로젝트에 시험용 장치를 추가해 확인했다(저장하지 않았다).
+
+### 모델과 화면 크기
+
+하드웨어 카탈로그의 Unified 장치를 하나씩 추가하고(`GET /api/project/add-device?type=OrderNumber:…/21.0.0.0&name=HMI_RT&order=<장치 이름>`)
+새 화면의 기본 크기를 읽었다. 모두 카탈로그의 해상도와 같다.
+
+| 계열 | 모델 | 화면 |
+|---|---|---|
+| Unified Comfort | MTP700 · MTP1000 · MTP1200 · MTP1500 · MTP1900 · MTP2200 | 800×480 · 1280×800 · 1280×800 · 1366×768 · 1920×1080 · 1920×1080 |
+| Unified Comfort PRO | MTP1200 · MTP1500 · MTP1900 · MTP2200 | 1280×800 · 1366×768 · 1920×1080 · 1920×1080 |
+| Unified Basic | MTP400 · MTP700 · MTP1000 · MTP1200 | 800×480 · 800×480 · 1280×800 · 1280×800 |
+| Unified PC | WinCC Unified PC RT | 기본 1920×1080, 다른 크기도 받는다(2560×1440 으로 확인) |
+
+- PC RT 는 `name=` 을 **빈 값**으로 줘야 추가된다(`name=HMI_RT` 는 "Invalid 'Name' parameter").
+- 화면의 `Width` · `Height` 는 패널에서도 다른 값이 거절되지 않는다 — 패널 해상도와 맞추는 것은 넣는 쪽의 몫이다.
+
+### 항목 종류
+
+모델 다섯(MTP400 Basic · MTP1000 Basic · MTP700 Comfort · MTP1500 Comfort · MTP2200 Comfort PRO)과 PC RT 에
+`item-types` 의 항목 종류 41개를 기본값으로 만들어 봤다(시스템 진단 컨트롤 · 컨테이너 3종 제외).
+
+- 도형 · 글 · 글 상자 · 버튼 · IO 필드 · 그래픽 뷰는 **모든 모델에서** 만들어진다.
+- Unified Basic 에서는 7종이 만들어지지 않는다: `HmiFunctionTrendControl` · `HmiMediaControl` · `HmiTrendCompanion` ·
+  `HmiProcessDiagnosis…` 4종.
+- `HmiLabel` 은 어느 장치에서도 만들어지지 않았다. `HmiProcessControl` 은 패널에서는 안 되고 PC RT 에서만 된다.
+
+### 이벤트
+
+이벤트 이름은 `item-types` 의 `events` 에 있다(어셈블리의 `<종류>EventType` 열거값).
+
+| 대상 | 이벤트 |
+|---|---|
+| 도형 · 글 · 글 상자 · IO 필드 · 그래픽 뷰 | `Activated` · `Deactivated` · `Tapped` · `KeyDown` · `KeyUp` · `ContextTapped` |
+| 버튼 | 위 여섯 + `Down` · `Up` |
+| 화면 | `Loaded` · `Unloaded` · `Tapped` · `ContextTapped` |
+
+위 표의 이벤트는 여섯 장치 모두에서 스크립트와 함께 만들어졌다. 만들어지지 않은 것은 알람 표시기의
+`AlarmStateTapped` 와 프로세스 진단 컨트롤의 버튼 이벤트 4개뿐이다.
+
+### 그림을 프로젝트 그래픽으로 넣기
+
+```bash
+curl -X POST "http://localhost:8099/api/hmi-unified/graphics?hmi=OP01" \
+  -H "Content-Type: application/json" --data-binary "@graphics.json"
+# { "graphics": [ { "name": "Logo", "file": "logo.svg", "data": "<base64>" } ] }
+```
+
+서버가 그래픽 가져오기 문서(`<이름>.xml` + `<이름> files/DefaultImageStream.<확장자>`)를 임시 폴더에 만들어
+`Graphics.Import(…, Override)` 로 넣는다. 같은 이름은 덮어쓴다. `data` 는 `data:` URL 이어도 된다.
+
+| 형식 | 결과 |
+|---|---|
+| svg · png · jpg(jpeg) · bmp · gif · tif | 들어간다. 다시 내보내면 **바이트가 같다** |
+| ico | 거절된다 |
+| 그림이 아닌 내용(확장자만 png) | 거절된다 — TIA 가 내용을 본다 |
+
+webp 는 해 보지 않았다. 런타임에서 gif · tif 가 어떻게 보이는지는 확인하지 않았다.
+
+화면 JSON 의 최상위 `graphics` 에 실으면 한 번에 된다 — 응답의 `graphicsImported` 가 넣은 수다.
+웹 편집기에서 그림 다섯(svg · png · jpg · bmp · gif)을 올려 그린 화면을 MTP700 Basic · MTP1500 Comfort · PC RT(2560×1440)에
+넣었다: 그림 5 · 항목 10 · 이벤트 6, 실패 0건, 7~9초.
+
+### 페이스플레이트 타입의 속은 Openness 로 닿지 않는다
+
+`GET /api/hmi-unified/library-type?hmi=&name=<타입 이름>[&dir=]` 로 라이브러리 타입 하나를 있는 그대로 볼 수 있다.
+
+- Unified 페이스플레이트는 런타임에서 일반 `LibraryType` / `LibraryTypeVersion` 이다. 컴포지션은 `Comment` · `Versions` 뿐이고
+  `GetSupportedExportFormats()` 는 비어 있다. Unified 페이스플레이트 타입을 다루는 클래스가 어셈블리에 없다.
+- `LibraryTypeVersion.Export()` 는 성공으로 돌아오지만 파일에는 작성자 · 버전 · 주석만 있다. `ExportAsDocuments` 는 아무것도 쓰지 않는다.
+- 그래서 페이스플레이트는 **놓기와 인터페이스 값 넣기**만 된다. 속을 읽거나, 만들거나, 고칠 수 없다.
+  `Edit()` · `Release()` 는 호출해 보지 않았다(프로젝트를 바꾼다).

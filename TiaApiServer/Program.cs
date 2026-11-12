@@ -4329,7 +4329,9 @@ namespace TiaApiServer
             if (route == "resources") { ListUnifiedResources(ctx, hmi); return; }
             if (route == "faceplates") { ListUnifiedFaceplates(ctx, hmi); return; }
             if (route == "graphics/export") { ExportUnifiedGraphics(ctx, hmi); return; }
+            if (route == "graphics" && ctx.Request.HttpMethod == "POST") { ImportUnifiedGraphicsRoute(ctx); return; }
             if (route == "catalog/export") { ExportUnifiedCatalog(ctx, hmi); return; }
+            if (route == "library-type") { ProbeUnifiedLibraryType(ctx); return; }
             if (route == "screen" && ctx.Request.HttpMethod == "GET") { DumpUnifiedScreen(ctx, hmi); return; }
             // ── 화면 생성 · 수정 · 삭제 (프로젝트를 바꾼다 — 저장은 하지 않는다) ──
             if (route == "screen" && (ctx.Request.HttpMethod == "POST" || ctx.Request.HttpMethod == "PUT")) { ApplyUnifiedScreen(ctx, hmi); return; }
@@ -4528,7 +4530,7 @@ namespace TiaApiServer
         //  속성 하나가 실패해도 멈추지 않고 failures 에 모은다. **저장(Save)은 하지 않는다.**
         // ══════════════════════════════════════════════════════════════
 
-        static readonly HashSet<string> UnifiedReserved = new HashSet<string> { "group", "name", "type", "typeName", "items", "dynamizations", "events", "interface" };
+        static readonly HashSet<string> UnifiedReserved = new HashSet<string> { "group", "name", "type", "typeName", "items", "dynamizations", "events", "interface", "graphics", "prune", "model" };
 
         static PropertyInfo UnifiedProp(Type t, string name)
         {
@@ -4726,8 +4728,9 @@ namespace TiaApiServer
                 bool screenCreated = screen == null;
                 if (screen == null) screen = (HmiScreen)UnifiedCall(screens, "Create", name);
 
-                int set = ApplyUnifiedProps(screen, body, "screen", failures);
                 object spec;
+                int graphicsImported = body.TryGetValue("graphics", out spec) ? ImportUnifiedGraphics(spec, failures) : 0;
+                int set = ApplyUnifiedProps(screen, body, "screen", failures);
                 int dyn = body.TryGetValue("dynamizations", out spec) ? ApplyUnifiedDynamizations(screen, spec, "screen", failures) : 0;
                 int evt = body.TryGetValue("events", out spec) ? ApplyUnifiedEvents(screen, spec, "screen", failures) : 0;
 
@@ -4763,10 +4766,32 @@ namespace TiaApiServer
                         catch (Exception ex) { failures.Add(new { where, key = "(create)", error = ex.Message }); }
                     }
                 }
+                // prune: true — 본문의 items 에 없는 항목을 지운다(화면을 본문과 똑같이 맞춘다)
+                int deleted = 0;
+                if (body.TryGetValue("prune", out spec) && spec is bool && (bool)spec && itemsObj is System.Collections.IEnumerable)
+                {
+                    var keep = new HashSet<string>();
+                    foreach (var raw in (System.Collections.IEnumerable)itemsObj)
+                    {
+                        var it = raw as Dictionary<string, object>;
+                        if (it != null && it.ContainsKey("name")) keep.Add(it["name"].ToString());
+                    }
+                    var doomed = new List<object>();
+                    foreach (var x in (System.Collections.IEnumerable)screen.ScreenItems)
+                        if (!keep.Contains(SafeAttr(x, "Name"))) doomed.Add(x);
+                    foreach (var x in doomed)
+                    {
+                        string dn = SafeAttr(x, "Name");
+                        try { x.GetType().GetMethod("Delete", Type.EmptyTypes).Invoke(x, null); deleted++; }
+                        catch (Exception ex) { failures.Add(new { where = "items." + dn, key = "(delete)", error = (ex.InnerException ?? ex).Message }); }
+                    }
+                }
                 SendJson(ctx.Response, 200, new
                 {
                     hmi = SafeAttr(hmi, "Name"),
                     path = (groupPath == "" ? "" : groupPath + "/") + name,
+                    graphicsImported,
+                    itemsDeleted = deleted,
                     screenCreated,
                     groupsCreated = createdGroups,
                     itemsCreated = created,
@@ -5011,6 +5036,84 @@ namespace TiaApiServer
         //  프로젝트 그래픽을 폴더로 내보낸다(그래픽마다 XML + 그림 파일). 바깥의 편집기가 팔레트에 쓸 그림이다.
         //  프로젝트는 바꾸지 않는다. 폴더는 없으면 만들고, 같은 이름의 파일은 덮어쓴다.
         // ══════════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════════
+        //  POST /api/hmi-unified/graphics?hmi=<장치>
+        //  본문: { "graphics": [ { "name": "Logo", "file": "logo.svg", "data": "<base64>" }, … ] }
+        //
+        //  그림 파일을 **프로젝트 그래픽**으로 넣는다(같은 이름이 있으면 덮어쓴다). 화면 JSON 의 최상위
+        //  "graphics" 에 같은 꼴로 실으면 화면을 넣을 때 먼저 들어간다. 저장하지 않는다.
+        // ══════════════════════════════════════════════════════════════
+        static void ImportUnifiedGraphicsRoute(HttpListenerContext ctx)
+        {
+            var body = ReadJsonBody(ctx);
+            object spec;
+            if (body == null || !body.TryGetValue("graphics", out spec)) { SendJson(ctx.Response, 400, new { error = "본문에 graphics 배열이 필요하다" }); return; }
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var failures = new List<object>();
+            try
+            {
+                int n = ImportUnifiedGraphics(spec, failures);
+                SendJson(ctx.Response, 200, new { graphicsImported = n, failureCount = failures.Count, failures, elapsedMs = sw.ElapsedMilliseconds, saved = false });
+            }
+            catch (Exception ex) { SendJson(ctx.Response, 500, new { error = ex.Message, failures }); }
+        }
+
+        static int ImportUnifiedGraphics(object spec, List<object> failures)
+        {
+            var list = spec as System.Collections.IEnumerable;
+            if (list == null || spec is string) { failures.Add(new { where = "graphics", key = "", error = "graphics 는 배열이어야 한다" }); return 0; }
+            Project proj = null;
+            foreach (Project pr in connectedPortal.Projects) { proj = pr; break; }
+            var comp = UnifiedProjectGraphics(proj);
+            if (comp == null) { failures.Add(new { where = "graphics", key = "", error = "프로젝트 그래픽 컬렉션을 찾지 못했다" }); return 0; }
+            var import = comp.GetType().GetMethod("Import", new[] { typeof(FileInfo), typeof(ImportOptions) });
+            if (import == null) { failures.Add(new { where = "graphics", key = "", error = "이 버전의 Openness 에 그래픽 Import 가 없다" }); return 0; }
+
+            string tmp = Path.Combine(Path.GetTempPath(), "tia-hmi-graphics-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tmp);
+            int done = 0;
+            try
+            {
+                foreach (var raw in list)
+                {
+                    var g = raw as Dictionary<string, object>;
+                    string name = g != null && g.ContainsKey("name") && g["name"] != null ? g["name"].ToString() : "";
+                    string where = "graphics." + name;
+                    try
+                    {
+                        if (name == "") throw new InvalidOperationException("name 이 없다");
+                        if (!g.ContainsKey("data") || g["data"] == null) throw new InvalidOperationException("data(base64)가 없다");
+                        string ext = Path.GetExtension(g.ContainsKey("file") && g["file"] != null ? g["file"].ToString() : "").TrimStart('.').ToLowerInvariant();
+                        if (ext == "") throw new InvalidOperationException("file 에 확장자가 없다");
+                        string b64 = g["data"].ToString();
+                        int comma = b64.IndexOf("base64,", StringComparison.Ordinal);      // data: URL 도 받는다
+                        if (comma >= 0) b64 = b64.Substring(comma + 7);
+                        byte[] bytes = Convert.FromBase64String(b64);
+
+                        string safe = string.Concat(name.Select(ch => Path.GetInvalidFileNameChars().Contains(ch) ? '_' : ch));
+                        string filesDir = Path.Combine(tmp, safe + " files");
+                        Directory.CreateDirectory(filesDir);
+                        File.WriteAllBytes(Path.Combine(filesDir, "DefaultImageStream." + ext), bytes);
+                        string xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Document>\n  <Engineering version=\"V" + selectedMajor + "\" />\n"
+                            + "  <Hmi.Globalization.MultiLingualGraphic ID=\"0\">\n    <AttributeList>\n"
+                            + "      <DefaultDithering>false</DefaultDithering>\n"
+                            + "      <DefaultImageStream external=\"path\">" + System.Security.SecurityElement.Escape(safe + " files\\DefaultImageStream." + ext) + "</DefaultImageStream>\n"
+                            + "      <DefaultSmoothness>false</DefaultSmoothness>\n"
+                            + "      <Name>" + System.Security.SecurityElement.Escape(name) + "</Name>\n"
+                            + "    </AttributeList>\n  </Hmi.Globalization.MultiLingualGraphic>\n</Document>\n";
+                        var fi = new FileInfo(Path.Combine(tmp, safe + ".xml"));
+                        File.WriteAllText(fi.FullName, xml, new UTF8Encoding(true));
+                        try { import.Invoke(comp, new object[] { fi, ImportOptions.Override }); }
+                        catch (TargetInvocationException tie) { throw tie.InnerException ?? tie; }
+                        done++;
+                    }
+                    catch (Exception ex) { failures.Add(new { where, key = "(import)", error = ex.Message }); }
+                }
+            }
+            finally { try { Directory.Delete(tmp, true); } catch { } }
+            return done;
+        }
+
         static void ExportUnifiedGraphics(HttpListenerContext ctx, HmiSoftware hmi)
         {
             string dir = ctx.Request.QueryString["dir"];
@@ -5063,6 +5166,132 @@ namespace TiaApiServer
             var errors = new List<string>();
             var result = ProbeUnifiedFaceplates(hmi, probe, ctx.Request.QueryString["filter"], errors);
             SendJson(ctx.Response, 200, new { count = result.Count, probed = probe, faceplates = result, errors, elapsedMs = sw.ElapsedMilliseconds });
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  GET /api/hmi-unified/library-type?hmi=<장치>&name=<타입 이름>[&dir=<폴더>]
+        //
+        //  프로젝트 라이브러리의 타입 하나를 **있는 그대로** 들여다본다 — Openness 가 그 타입에 대해
+        //  실제로 무엇을 내주는가(런타임 타입 · 속성 · 컴포지션 · 호출 · 내보내기 형식).
+        //  dir 을 주면 버전마다 Export / ExportAsDocuments 를 해 보고 결과(성공 · 오류 문구)를 적는다.
+        //  프로젝트는 바꾸지 않는다.
+        // ══════════════════════════════════════════════════════════════
+        static object LibFindType(object folder, string name, string path, out string foundPath)
+        {
+            foundPath = null;
+            var types = folder.GetType().GetProperty("Types").GetValue(folder, null) as System.Collections.IEnumerable;
+            foreach (var t in types)
+                if (SafeAttr(t, "Name") == name) { foundPath = path; return t; }
+            var folders = folder.GetType().GetProperty("Folders").GetValue(folder, null) as System.Collections.IEnumerable;
+            foreach (var f in folders)
+            {
+                var r = LibFindType(f, name, (path == "" ? "" : path + "/") + SafeAttr(f, "Name"), out foundPath);
+                if (r != null) return r;
+            }
+            return null;
+        }
+
+        static Dictionary<string, object> LibDescribe(IEngineeringObject o, List<string> errors)
+        {
+            var d = new Dictionary<string, object>();
+            d["runtimeType"] = o.GetType().FullName;
+            var attrs = new Dictionary<string, object>();
+            try
+            {
+                foreach (var ai in o.GetAttributeInfos())
+                {
+                    object v;
+                    try { v = UnifiedValue(o.GetAttribute(ai.Name)); } catch (Exception ex) { v = "!" + ex.Message; }
+                    attrs[ai.Name] = new { value = v, access = ai.AccessMode.ToString() };
+                }
+            }
+            catch (Exception ex) { errors.Add("GetAttributeInfos: " + ex.Message); }
+            d["attributes"] = attrs;
+            try { d["compositions"] = o.GetCompositionInfos().Select(c => c.Name).ToList(); }
+            catch (Exception ex) { errors.Add("GetCompositionInfos: " + ex.Message); }
+            try
+            {
+                d["invocations"] = o.GetInvocationInfos().Select(i => i.Name + "(" + string.Join(", ", i.ParameterInfos.Select(pi => pi.Type.Name + " " + pi.Name)) + ")").ToList();
+            }
+            catch (Exception ex) { errors.Add("GetInvocationInfos: " + ex.Message); }
+            return d;
+        }
+
+        static string LibTry(Action a)
+        {
+            try { a(); return "ok"; }
+            catch (TargetInvocationException tie) { var e = tie.InnerException ?? tie; return e.GetType().Name + ": " + e.Message; }
+            catch (Exception ex) { return ex.GetType().Name + ": " + ex.Message; }
+        }
+
+        static void ProbeUnifiedLibraryType(HttpListenerContext ctx)
+        {
+            string name = ctx.Request.QueryString["name"];
+            string dir = ctx.Request.QueryString["dir"];
+            if (string.IsNullOrEmpty(name)) { SendJson(ctx.Response, 400, new { error = "Missing ?name=" }); return; }
+            var errors = new List<string>();
+            try
+            {
+                Project proj = null;
+                foreach (Project pr in connectedPortal.Projects) { proj = pr; break; }
+                string path;
+                var type = LibFindType(proj.ProjectLibrary.TypeFolder, name, "", out path) as IEngineeringObject;
+                if (type == null) { SendJson(ctx.Response, 404, new { error = "타입을 찾지 못했다: " + name }); return; }
+
+                var result = LibDescribe(type, errors);
+                result["folder"] = path;
+                var fmtM = type.GetType().GetMethod("GetSupportedExportFormats", Type.EmptyTypes);
+                var formats = new List<string>();
+                if (fmtM == null) result["supportedExportFormats"] = "(이 버전의 Openness 에 없음)";
+                else
+                {
+                    string r = LibTry(() => { foreach (var f in (System.Collections.IEnumerable)fmtM.Invoke(type, null)) formats.Add(Convert.ToString(f)); });
+                    result["supportedExportFormats"] = r == "ok" ? (object)formats : r;
+                }
+
+                var versions = new List<object>();
+                var vs = type.GetType().GetProperty("Versions").GetValue(type, null) as System.Collections.IEnumerable;
+                foreach (var vo in vs)
+                {
+                    var v = (IEngineeringObject)vo;
+                    var vd = LibDescribe(v, errors);
+                    string vn = SafeAttr(v, "VersionNumber");
+                    if (!string.IsNullOrEmpty(dir))
+                    {
+                        Directory.CreateDirectory(dir);
+                        string safe = string.Concat((name + "_V" + vn).Select(ch => Path.GetInvalidFileNameChars().Contains(ch) ? '_' : ch));
+                        var tries = new Dictionary<string, object>();
+                        var exp = v.GetType().GetMethod("Export", new[] { typeof(FileInfo), typeof(ExportOptions) });
+                        if (exp == null) tries["Export"] = "(메서드 없음)";
+                        else
+                        {
+                            var fi = new FileInfo(Path.Combine(dir, safe + ".xml"));
+                            if (fi.Exists) fi.Delete();
+                            tries["Export"] = LibTry(() => exp.Invoke(v, new object[] { fi, ExportOptions.WithDefaults }));
+                        }
+                        var ead = v.GetType().GetMethods().FirstOrDefault(m => m.Name == "ExportAsDocuments" && m.GetParameters().Length == 4);
+                        if (ead == null) tries["ExportAsDocuments"] = "(메서드 없음)";
+                        else
+                        {
+                            var optT = ead.GetParameters()[3].ParameterType;
+                            object opt = optT.IsEnum ? Enum.ToObject(optT, 0) : (optT.IsValueType ? Activator.CreateInstance(optT) : null);
+                            var tryFormats = formats.Count > 0 ? formats : new List<string> { "SimaticSD", "SimaticML" };
+                            foreach (var f in tryFormats)
+                            {
+                                string sub = Path.Combine(dir, safe + "_" + f);
+                                Directory.CreateDirectory(sub);
+                                tries["ExportAsDocuments:" + f] = LibTry(() => ead.Invoke(v, new object[] { new DirectoryInfo(sub), safe, f, opt }));
+                            }
+                        }
+                        vd["exportTries"] = tries;
+                    }
+                    versions.Add(vd);
+                }
+                result["versions"] = versions;
+                result["errors"] = errors;
+                SendJson(ctx.Response, 200, result);
+            }
+            catch (Exception ex) { SendJson(ctx.Response, 500, new { error = ex.ToString(), errors }); }
         }
 
         static List<object> ProbeUnifiedFaceplates(HmiSoftware hmi, bool probe, string filter, List<string> errors)
