@@ -4328,6 +4328,9 @@ namespace TiaApiServer
             if (route == "item-types") { ListUnifiedItemTypes(ctx); return; }
             if (route == "resources") { ListUnifiedResources(ctx, hmi); return; }
             if (route == "faceplates") { ListUnifiedFaceplates(ctx, hmi); return; }
+            if (route == "tags") { ListUnifiedHmiTags(ctx, hmi); return; }
+            if (route == "tag" && ctx.Request.HttpMethod == "POST") { ApplyUnifiedHmiTag(ctx, hmi); return; }
+            if (route == "tag" && ctx.Request.HttpMethod == "DELETE") { DeleteUnifiedHmiTag(ctx, hmi); return; }
             if (route == "graphics/export") { ExportUnifiedGraphics(ctx, hmi); return; }
             if (route == "graphics" && ctx.Request.HttpMethod == "POST") { ImportUnifiedGraphicsRoute(ctx); return; }
             if (route == "catalog/export") { ExportUnifiedCatalog(ctx, hmi); return; }
@@ -4677,7 +4680,8 @@ namespace TiaApiServer
             {
                 try
                 {
-                    object ev = Enum.Parse(enumType, kv.Key, true);
+                    // 커스텀 웹 컨트롤 · 동적 SVG 위젯의 이벤트는 열거형이 아니라 컨트롤이 정한 이름(문자열)이다
+                    object ev = enumType.IsEnum ? Enum.Parse(enumType, kv.Key, true) : (object)kv.Key;
                     var handler = UnifiedCall(comp, "Find", ev);
                     if (kv.Value == null) { if (handler != null) UnifiedCall(handler, "Delete"); n++; continue; }
                     if (handler == null) handler = UnifiedCall(comp, "Create", ev);
@@ -4860,6 +4864,16 @@ namespace TiaApiServer
 
         // 페이스플레이트 · 커스텀 위젯의 인터페이스 — { "속성": 값 } 또는 { "속성": { "Value": 값, "dynamizations": {…} } }
         // 인터페이스 속성은 타입이 정한다. 만들 수는 없고 있는 것을 찾아 값을 넣는다.
+        // 인터페이스 값은 지금 들어 있는 값의 타입에 맞춰 넣는다. 타입이 다른 값(예: 색 자리에 문자열)을 그대로 넣으면
+        // TIA 안에서 InvalidCastException 이 나고 TIA 가 내려간다(2026-11-16, 커스텀 웹 컨트롤의 색 속성에서 확인).
+        static object UnifiedInterfaceValue(IEngineeringObject entry, object v)
+        {
+            if (v == null) return null;
+            object cur = null;
+            try { cur = entry.GetAttribute("Value"); } catch { }
+            return cur == null ? v : UnifiedConvert(v, cur.GetType());
+        }
+
         static int ApplyUnifiedInterface(IEngineeringObject item, object spec, string where, List<object> failures)
         {
             var dict = spec as Dictionary<string, object>;
@@ -4875,9 +4889,9 @@ namespace TiaApiServer
                     var entry = UnifiedCall(comp, "Find", kv.Key) as IEngineeringObject;
                     if (entry == null) throw new InvalidOperationException("인터페이스 속성이 없다");
                     var d = kv.Value as Dictionary<string, object>;
-                    if (d == null) { entry.SetAttribute("Value", kv.Value); n++; continue; }
+                    if (d == null) { entry.SetAttribute("Value", UnifiedInterfaceValue(entry, kv.Value)); n++; continue; }
                     object v;
-                    if (d.TryGetValue("Value", out v)) { entry.SetAttribute("Value", v); n++; }
+                    if (d.TryGetValue("Value", out v)) { entry.SetAttribute("Value", UnifiedInterfaceValue(entry, v)); n++; }
                     if (d.TryGetValue("dynamizations", out v)) n += ApplyUnifiedDynamizations(entry, v, where + ".interface." + kv.Key, failures);
                 }
                 catch (Exception ex) { failures.Add(new { where, key = "interface." + kv.Key, error = ex.Message }); }
@@ -5462,6 +5476,105 @@ namespace TiaApiServer
         }
 
         // GET /api/hmi-unified/connections/list?hmi=
+        // ══════════════════════════════════════════════════════════════
+        //  Unified HMI 태그
+        //
+        //  GET    /api/hmi-unified/tags?hmi=<장치>[&filter=<이름 일부>][&limit=200][&attrs=true]
+        //  POST   /api/hmi-unified/tag?hmi=<장치>   본문 { "name": "...", "attrs": { "Connection": "...", "PlcTag": "..." } }
+        //  DELETE /api/hmi-unified/tag?hmi=<장치>&name=<태그>
+        //
+        //  attrs 는 적힌 순서대로 넣는다(Connection 을 먼저 넣어야 PlcTag 가 들어간다). 저장은 하지 않는다.
+        // ══════════════════════════════════════════════════════════════
+        static readonly string[] UnifiedTagKeys = { "Name", "DataType", "HmiDataType", "Connection", "PlcTag", "PlcName", "Address", "AccessMode", "TagTableName" };
+
+        static Dictionary<string, object> UnifiedTagInfo(IEngineeringObject t)
+        {
+            var d = new Dictionary<string, object>();
+            foreach (var k in UnifiedTagKeys)
+            {
+                try { d[k] = UnifiedValue(t.GetAttribute(k)); } catch { }
+            }
+            try
+            {
+                var mp = UnifiedProp(t.GetType(), "Members");
+                if (mp != null)
+                {
+                    var names = new List<string>();
+                    foreach (var m in (System.Collections.IEnumerable)mp.GetValue(t, null)) names.Add(SafeAttr(m, "Name"));
+                    d["members"] = names;
+                }
+            }
+            catch (Exception ex) { d["membersError"] = ex.Message; }
+            return d;
+        }
+
+        static void ListUnifiedHmiTags(HttpListenerContext ctx, HmiSoftware hmi)
+        {
+            string filter = ctx.Request.QueryString["filter"];
+            int limit; if (!int.TryParse(ctx.Request.QueryString["limit"], out limit)) limit = 200;
+            bool attrs = ctx.Request.QueryString["attrs"] == "true";
+            try
+            {
+                var list = new List<object>();
+                int total = 0; object attrNames = null;
+                foreach (var o in (System.Collections.IEnumerable)hmi.Tags)
+                {
+                    var eo = (IEngineeringObject)o;
+                    string name = SafeAttr(eo, "Name");
+                    if (!string.IsNullOrEmpty(filter) && (name == null || name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)) continue;
+                    total++;
+                    if (attrs && attrNames == null) attrNames = eo.GetAttributeInfos().Select(i => i.Name + ":" + i.AccessMode).ToList();
+                    if (list.Count < limit) list.Add(UnifiedTagInfo(eo));
+                }
+                SendJson(ctx.Response, 200, new { count = total, tags = list, attributes = attrNames });
+            }
+            catch (Exception ex) { SendJson(ctx.Response, 500, new { error = ex.ToString() }); }
+        }
+
+        static void ApplyUnifiedHmiTag(HttpListenerContext ctx, HmiSoftware hmi)
+        {
+            var body = ReadJsonBody(ctx);
+            if (body == null || !body.ContainsKey("name")) { SendJson(ctx.Response, 400, new { error = "본문에 name(태그 이름)이 필요하다" }); return; }
+            string name = body["name"].ToString();
+            var failures = new List<object>();
+            try
+            {
+                object tags = hmi.Tags;
+                var tag = UnifiedCall(tags, "Find", name) as IEngineeringObject;
+                bool created = tag == null;
+                if (tag == null) tag = (IEngineeringObject)UnifiedCall(tags, "Create", name);
+                object spec;
+                if (body.TryGetValue("attrs", out spec) && spec is Dictionary<string, object>)
+                {
+                    foreach (var kv in (Dictionary<string, object>)spec)
+                    {
+                        try
+                        {
+                            object cur = null;
+                            try { cur = tag.GetAttribute(kv.Key); } catch { }
+                            tag.SetAttribute(kv.Key, cur == null ? kv.Value : UnifiedConvert(kv.Value, cur.GetType()));
+                        }
+                        catch (Exception ex) { failures.Add(new { attr = kv.Key, error = (ex.InnerException ?? ex).Message }); }
+                    }
+                }
+                SendJson(ctx.Response, 200, new { created, tag = UnifiedTagInfo(tag), failures });
+            }
+            catch (Exception ex) { SendJson(ctx.Response, 500, new { error = (ex.InnerException ?? ex).Message, failures }); }
+        }
+
+        static void DeleteUnifiedHmiTag(HttpListenerContext ctx, HmiSoftware hmi)
+        {
+            string name = ctx.Request.QueryString["name"];
+            try
+            {
+                var tag = UnifiedCall(hmi.Tags, "Find", name);
+                if (tag == null) { SendJson(ctx.Response, 404, new { error = "Tag not found: " + name }); return; }
+                UnifiedCall(tag, "Delete");
+                SendJson(ctx.Response, 200, new { deleted = name });
+            }
+            catch (Exception ex) { SendJson(ctx.Response, 500, new { error = (ex.InnerException ?? ex).Message }); }
+        }
+
         static void ListUnifiedHmiConnections(HttpListenerResponse resp, HmiSoftware hmi)
         {
             var list = new List<object>();

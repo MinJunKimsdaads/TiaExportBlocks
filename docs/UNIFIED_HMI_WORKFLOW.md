@@ -264,6 +264,7 @@ curl -X DELETE -G "http://localhost:8099/api/hmi-unified/screen-group" --data-ur
 - 카탈로그에 HMI 태그 목록 싣기(편집기가 태그 이름을 검사하고 고르게 할 수 있다).
 - 편집기: 기존 화면(GET 꼴) 불러오기, 여러 항목 선택 · 정렬, emf 그림 미리보기.
 - Swagger 문서(`openapi.json`)에 이 엔드포인트들을 싣기.
+- 페이스플레이트 인터페이스가 기대하는 UDT 를 자동으로 알아내기(컴파일 결과물의 멤버 이름 + UDT 정의로 길은 있다).
 - V20 빌드에서의 확인(코드는 리플렉션으로 써서 같은 소스로 컴파일되지만 돌려 보지 않았다).
 
 ---
@@ -342,3 +343,62 @@ webp 는 해 보지 않았다. 런타임에서 gif · tif 가 어떻게 보이�
 - `LibraryTypeVersion.Export()` 는 성공으로 돌아오지만 파일에는 작성자 · 버전 · 주석만 있다. `ExportAsDocuments` 는 아무것도 쓰지 않는다.
 - 그래서 페이스플레이트는 **놓기와 인터페이스 값 넣기**만 된다. 속을 읽거나, 만들거나, 고칠 수 없다.
   `Edit()` · `Release()` 는 호출해 보지 않았다(프로젝트를 바꾼다).
+
+---
+
+## 8. 2026-11-17 에 더 확인한 것 — 페이스플레이트에 PLC 태그 잇기
+
+V21 Update 2 · MTP1200 Unified Comfort · S7-1500 한 대의 프로젝트에서 확인했다. 이름은 지어낸 것이다.
+
+### HMI 태그 만들기
+
+```bash
+# 목록 (속성까지 보려면 attrs=true)
+curl "http://localhost:8099/api/hmi-unified/tags?hmi=HMI_1&filter=Line&attrs=true"
+# 만들기 · 고치기 — attrs 는 적은 순서대로 넣는다. Connection 을 먼저, PlcTag 를 나중에
+curl -X POST "http://localhost:8099/api/hmi-unified/tag?hmi=HMI_1" -H "Content-Type: application/json" \
+  -d '{ "name": "Line1_Monitor", "attrs": { "Connection": "HMI_Connection_1", "PlcTag": "DB_Line.monitor[0]" } }'
+# 지우기
+curl -X DELETE "http://localhost:8099/api/hmi-unified/tag?hmi=HMI_1&name=Line1_Monitor"
+```
+
+- PLC 태그를 이으면 HMI 태그의 자료형이 그 PLC UDT 가 되고 멤버가 펼쳐진다.
+- **통합 HMI 연결은 Openness 로 만들 수 없다.** `HmiConnection` 의 `Partner` · `Station` · `Node` 는 쓰기가
+  "not supported" 다. 네트워크 뷰에서 사람이 한 번 연결해야 한다. 연결이 없으면 `PlcTag` 쓰기가
+  "The controller tag … was not found" 로 거절된다.
+- 내부 태그에 UDT 자료형을 주는 길은 없었다(`DataType` 은 "Empty data type or HMI data type", `HmiDataType` 은 쓰기 막힘).
+
+### 인터페이스에 태그 넣기
+
+화면 JSON 의 페이스플레이트 항목 `interface` 에 **HMI 태그 이름**을 넣는다. 태그 인터페이스와 속성 인터페이스가
+같은 목록(`Interface` 컴포지션의 `PropertyName` · `Value`)에 섞여 있다.
+
+```json
+{ "type": "HmiFaceplateContainer", "name": "fp_line1", "containedType": "V1.0.0\fpLineMonitor",
+  "interface": { "monitorTags": "Line1_Monitor" } }
+```
+
+- 넣을 때는 아무것도 검사하지 않는다. **장치를 컴파일해야** 틀린 것이 드러난다.
+  - 구조가 다른 UDT: `Interface.<이름>: The structure of the user data type configured at tag '…' does not match …`
+  - 없는 태그 · 속성 인터페이스에 태그 이름: `Interface: The object "…" at the property "…" does not exist.`
+- 같은 화면에 맞는 것과 틀린 것(배열 태그)을 함께 넣어 컴파일해, 맞는 쪽은 에러 0 · 틀린 쪽만 위 에러가 나는 것을 확인했다.
+- **HMI 소프트웨어만 컴파일하는 길은 없다.** `ICompilable` 은 장치(`Device`)에만 있다. 그래서 하드웨어 설정 에러
+  (예: HMI 의 두 인터페이스가 같은 서브넷)가 있으면 화면 검사까지 가지 못한다.
+
+### 페이스플레이트의 속은 컴파일 결과물에 있다
+
+Openness 로는 닿지 않지만(7절), 장치를 컴파일하면 `<프로젝트>\IM\HMI\I\0\Context\` 아래에 런타임 파일이 생긴다.
+
+| 위치 | 내용 |
+|---|---|
+| `faceplates\faceplate_<n>.rdf` | 화면에 놓인 페이스플레이트 타입 하나 — 안쪽 항목 이름 · 위치 · 크기, 버튼 이벤트 스크립트(평문 JS), 인터페이스 멤버 이름 |
+| `screens\screen_<n>.rdf` | 화면 |
+| `general\textLibrary_<id>_<언어>.rdf` | 보이는 글자 |
+
+- 머리는 `RDF\0`, 레코드는 `속성 번호(u32) · 형(u8) · 값` 이다. 형 `0x0e` 는 길이 한 바이트 + 글자, `0x04` · `0x08` 은 int32.
+  속성 2 = 이름, 4 = 너비, 5 = 높이, 0x62 = 왼쪽, 0x63 = 위(화면 파일의 알려진 크기로 맞췄다).
+- 시험한 타입 하나에서 항목 48개의 이름 · 위치 · 크기가 TIA 편집기 화면과 맞았다. 색 · 글꼴 · 글자와 항목의 연결 ·
+  동적화 · 항목 종류 번호는 아직 못 풀었다.
+- **화면에 놓여 컴파일된 타입만** 나온다. 문서화되지 않은 내부 형식이고 V21 에서만 봤다. 런타임 파일이라 재배포하지 않는다.
+- 라이브러리 타입을 워크스페이스(VCI)로 내보내도 PLC UDT 만 나오고 페이스플레이트 타입은 빠진다. 그 UDT 정의(SimaticML)가
+  인터페이스가 기대하는 구조를 맞추는 근거는 된다.
